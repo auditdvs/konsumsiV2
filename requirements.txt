@@ -1,0 +1,5 @@
+streamlit>=1.36
+pandas>=2.0
+lxml>=5.0
+html5lib>=1.1
+openpyxl>=3.1
