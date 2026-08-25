@@ -776,7 +776,7 @@ def build_excel(alloc: pd.DataFrame, harga_beras, harga_galon, harga_isi_ulang) 
 
 st.title("Breakdown Biaya Konsumsi Bulanan")
 st.write(
-    "Upload laporan Transaction Listing By Accounts untuk akun Biaya Konsumsi. "
+    "Upload laporan Transaction Listing By Accounts (file original **.xls nya langsung ya tanpa di edit apapun) untuk akun Biaya Konsumsi. "
     "Aplikasi ini memecah transaksi per bulan menjadi: kopi/gula/teh, beras, galon "
     "aqua asli (beli baru), isi ulang galon, serta jumsih dan mini training."
 )
