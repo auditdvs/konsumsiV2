@@ -13,8 +13,16 @@ st.set_page_config(page_title="Breakdown Biaya Konsumsi", layout="wide")
 FONT_NAME = "Arial"
 
 # =========================================================
-# 1. PARSER FILE LAPORAN (Transaction Listing By Accounts)
+# 1. PARSER FILE LAPORAN
 # =========================================================
+#
+# Mendukung dua format:
+# A. Format lama "TRANSACTION LISTING BY ACCOUNTS" (blok per Account No,
+#    diakhiri baris TOTAL).
+# B. Format baru: tabel flat dengan header
+#    VOUCHER NO. | TRANS. DATE | ENTRY DATE | DESCRIPTION | DEBIT | CREDIT
+#    tanpa blok Account No / TOTAL. Parser mendeteksi baris header ini
+#    secara otomatis lalu membaca seluruh baris di bawahnya sebagai data.
 
 def load_raw_table(uploaded_file):
     """Coba beberapa cara baca file: html (xls export), excel asli, atau csv."""
@@ -64,12 +72,84 @@ def _parse_num(val) -> float:
         return 0.0
 
 
-def parse_report(raw_df: pd.DataFrame) -> pd.DataFrame:
+def _find_header_row(raw_df: pd.DataFrame, max_scan: int = 15):
     """
-    Ambil baris transaksi dari format 'TRANSACTION LISTING BY ACCOUNTS'.
+    Cari baris header tabel flat (mengandung 'VOUCHER' dan 'DEBIT') di antara
+    max_scan baris pertama. Return (index_baris, list_nama_kolom_upper) atau
+    (None, None) kalau tidak ditemukan.
+    """
+    n_scan = min(max_scan, len(raw_df))
+    for i in range(n_scan):
+        row_vals = [str(v).strip().upper() for v in raw_df.iloc[i].tolist()]
+        if any("VOUCHER" in v for v in row_vals) and any("DEBIT" in v for v in row_vals):
+            return i, row_vals
+    return None, None
+
+
+def _parse_flat_table(raw_df: pd.DataFrame, header_idx: int, header_vals: list) -> pd.DataFrame:
+    """
+    Parser untuk format baru: tabel flat tanpa blok Account No / TOTAL.
+    Kolom diidentifikasi berdasarkan nama header, bukan posisi tetap, supaya
+    tetap tahan kalau urutan kolom sedikit berubah.
+    """
+    col_map = {name: j for j, name in enumerate(header_vals)}
+
+    def find_col(*keys):
+        for name, j in col_map.items():
+            if any(key in name for key in keys):
+                return j
+        return None
+
+    idx_voucher = find_col("VOUCHER")
+    idx_trans = find_col("TRANS")
+    idx_entry = find_col("ENTRY")
+    idx_desc = find_col("DESCRIPTION", "DESKRIPSI", "KETERANGAN")
+    idx_debit = find_col("DEBIT")
+    idx_credit = find_col("CREDIT")
+
+    records = []
+    n_cols = raw_df.shape[1]
+
+    for i in range(header_idx + 1, len(raw_df)):
+        c0 = raw_df.iat[i, idx_voucher] if idx_voucher is not None and idx_voucher < n_cols else None
+        c0_str = str(c0).strip() if c0 is not None else ""
+
+        if c0_str in ("", "nan", "None"):
+            continue
+        if re.match(r"^\s*(TOTAL|ENDING BALANCE|GRAND TOTAL)", c0_str, re.IGNORECASE):
+            continue
+
+        tanggal = _parse_date(raw_df.iat[i, idx_trans]) if idx_trans is not None else pd.NaT
+        if pd.isna(tanggal):
+            # baris tanpa tanggal valid (mis. baris kosong / catatan kaki) dilewati
+            continue
+
+        entry_date = _parse_date(raw_df.iat[i, idx_entry]) if idx_entry is not None else pd.NaT
+        deskripsi = str(raw_df.iat[i, idx_desc]) if idx_desc is not None else ""
+        debit = _parse_num(raw_df.iat[i, idx_debit]) if idx_debit is not None else 0.0
+        credit = _parse_num(raw_df.iat[i, idx_credit]) if idx_credit is not None else 0.0
+
+        records.append(
+            dict(
+                akun=None,
+                voucher=c0_str,
+                tanggal=tanggal,
+                entry_date=entry_date,
+                deskripsi=deskripsi,
+                debit=debit,
+                credit=credit,
+            )
+        )
+
+    return pd.DataFrame(records)
+
+
+def _parse_block_table(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parser format lama "TRANSACTION LISTING BY ACCOUNTS": baris data berada
+    di antara baris 'Account No. ...' dan baris 'TOTAL ...'.
     Kolom (0-indexed): 0=voucher, 1=trans date, 2=entry date, 3=deskripsi,
-                       4=debit (Amount in Base CCY), 5=credit (Amount in Base CCY).
-    Baris data berada di antara baris 'Account No. ...' dan baris 'TOTAL ...'.
+                       4=debit, 5=credit.
     """
     records = []
     in_data = False
@@ -99,9 +179,9 @@ def parse_report(raw_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         entry_date = _parse_date(raw_df.iat[i, 2]) if n_cols > 2 else pd.NaT
-        deskripsi  = str(raw_df.iat[i, 3]) if n_cols > 3 else ""
-        debit      = _parse_num(raw_df.iat[i, 4]) if n_cols > 4 else 0.0
-        credit     = _parse_num(raw_df.iat[i, 5]) if n_cols > 5 else 0.0
+        deskripsi = str(raw_df.iat[i, 3]) if n_cols > 3 else ""
+        debit = _parse_num(raw_df.iat[i, 4]) if n_cols > 4 else 0.0
+        credit = _parse_num(raw_df.iat[i, 5]) if n_cols > 5 else 0.0
 
         records.append(
             dict(
@@ -116,6 +196,21 @@ def parse_report(raw_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return pd.DataFrame(records)
+
+
+def parse_report(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deteksi format sumber secara otomatis:
+    - Kalau ketemu baris header 'VOUCHER ... DEBIT ...' -> format tabel flat baru.
+    - Kalau tidak -> fallback ke format lama berbasis blok Account No / TOTAL.
+    """
+    header_idx, header_vals = _find_header_row(raw_df)
+    if header_idx is not None:
+        result = _parse_flat_table(raw_df, header_idx, header_vals)
+        if not result.empty:
+            return result
+
+    return _parse_block_table(raw_df)
 
 
 
@@ -775,11 +870,15 @@ def build_excel(alloc: pd.DataFrame, harga_beras, harga_galon, harga_isi_ulang) 
 # =========================================================
 
 st.title("Breakdown Biaya Konsumsi Bulanan")
-st.write("- Upload laporan Transaction Listing By Accounts (file original **.xls nya langsung ya tanpa di edit apapun) untuk akun Biaya Konsumsi. ")
-st.write("- Aplikasi ini memecah transaksi per bulan menjadi: kopi/gula/teh, beras, galon ")
-st.write("- Aqua asli (beli baru), isi ulang galon, serta jumsih dan mini training.")
+st.write(
+    "Upload laporan transaksi akun Biaya Konsumsi (format tabel VOUCHER NO. / "
+    "TRANS. DATE / ENTRY DATE / DESCRIPTION / DEBIT / CREDIT, atau format lama "
+    "Transaction Listing By Accounts). Aplikasi ini memecah transaksi per bulan "
+    "menjadi: kopi/gula/teh, beras, galon aqua asli (beli baru), isi ulang galon, "
+    "serta jumsih dan mini training."
+)
 
-uploaded = st.file_uploader("Upload file laporan (.xls)", type=["xls"])
+uploaded = st.file_uploader("Upload file laporan (.xls, .xlsx, atau .csv)", type=["xls", "xlsx", "csv"])
 
 if uploaded is None:
     st.info("Silakan upload file laporan konsumsi untuk mulai.")
@@ -787,12 +886,12 @@ if uploaded is None:
 
 raw = load_raw_table(uploaded)
 if raw is None or raw.empty:
-    st.error("File tidak bisa dibaca. Pastikan formatnya sama seperti export 'Transaction Listing By Accounts'.")
+    st.error("File tidak bisa dibaca. Pastikan formatnya berupa tabel dengan kolom VOUCHER NO., TRANS. DATE, ENTRY DATE, DESCRIPTION, DEBIT, CREDIT.")
     st.stop()
 
 trans = parse_report(raw)
 if trans.empty:
-    st.error("Tidak ada baris transaksi yang terdeteksi. Cek kembali format file.")
+    st.error("Tidak ada baris transaksi yang terdeteksi. Cek kembali format file (pastikan ada header VOUCHER NO. dan DEBIT).")
     st.stop()
 
 st.write(
